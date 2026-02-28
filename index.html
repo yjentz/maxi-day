@@ -1,0 +1,574 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <title>Normal Maxi Day</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #0d0d1a;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      min-height: 100vh;
+      font-family: 'Courier New', monospace;
+      overflow: hidden;
+      user-select: none;
+    }
+    #title {
+      color: #ffdd00;
+      font-size: 13px;
+      letter-spacing: 6px;
+      margin-bottom: 6px;
+      text-shadow: 0 0 10px #ffaa00;
+      text-transform: uppercase;
+    }
+    #ui {
+      color: #ffdd00;
+      font-size: 19px;
+      letter-spacing: 3px;
+      margin-bottom: 8px;
+      text-shadow: 0 0 8px #ff8800;
+    }
+    canvas {
+      border: 3px solid #aa5500;
+      box-shadow: 0 0 28px #aa550088, 0 0 55px #55220044;
+      display: block;
+      cursor: pointer;
+    }
+    #hint {
+      color: #665533;
+      font-size: 12px;
+      margin-top: 8px;
+      letter-spacing: 2px;
+    }
+    #loading { display: none; }
+  </style>
+</head>
+<body>
+
+<div id="loading"></div>
+
+<div id="title">— Normal Maxi Day —</div>
+<div id="ui">
+  SCORE: <span id="scoreDisplay">0</span>
+  &nbsp;&nbsp;&nbsp;
+  BEST: <span id="hiDisplay">0</span>
+  &nbsp;&nbsp;&nbsp;
+  LEBEN: <span id="livesDisplay">3</span>
+</div>
+<canvas id="c" width="820" height="380"></canvas>
+<div id="hint">LEERTASTE oder KLICK • DOPPELSPRUNG möglich</div>
+
+<audio id="music" src="Papst.m4a" loop></audio>
+
+<script>
+const canvas = document.getElementById('c');
+const ctx    = canvas.getContext('2d');
+const W = 820, H = 380;
+const GROUND = 290;
+
+// ── MUSIC ─────────────────────────────────────────────────────────────────────
+const music = document.getElementById('music');
+let musicOn = false;
+function tryMusic() {
+  if (!musicOn) {
+    music.volume = 0.5;
+    music.play().catch(() => {});
+    musicOn = true;
+  }
+}
+
+// ── ASSET LOADING ─────────────────────────────────────────────────────────────
+let charImg   = null;
+let charAspect = 0.72;
+
+const rawImg = new Image();
+rawImg.onload = function() {
+  charAspect = rawImg.naturalWidth / rawImg.naturalHeight;
+  charImg    = rawImg;
+};
+rawImg.src = 'Objekt.png';
+
+// ── CONSTANTS ─────────────────────────────────────────────────────────────────
+// Character on RIGHT, barrels from LEFT → moving right
+const CHAR_H = 165;
+const CHAR_W = Math.round(CHAR_H * 0.72);  // will be updated after load
+
+const BARREL_W = 50, BARREL_H = 44;
+
+// ── STATE ─────────────────────────────────────────────────────────────────────
+const ST = { MENU:0, PLAYING:1, DEAD:2, GAMEOVER:3 };
+let state      = ST.MENU;
+let score      = 0;
+let hiScore    = 0;
+let lives      = 3;
+let frameCount = 0;
+let gameSpeed  = 1;
+
+// ── PLAYER (right side, faces left toward barrels) ───────────────────────────
+const player = {
+  get w() { return charImg ? Math.round(CHAR_H * charAspect) : CHAR_W; },
+  h: CHAR_H,
+  get x() { return W - 80 - this.w; },  // fixed on right
+  y: GROUND - CHAR_H,
+  vy: 0,
+  jumpsLeft: 2,
+  isJumping: false,
+  squish: 1,
+  invincible: 0,
+};
+// Cache x/y as mutable vars for physics
+let px, py, pvy, pJumps, pSquish, pInv, pIsJumping;
+
+function initPlayerVars() {
+  const pw = charImg ? Math.round(CHAR_H * charAspect) : CHAR_W;
+  px        = W - 80 - pw;
+  py        = GROUND - CHAR_H;
+  pvy       = 0;
+  pJumps    = 2;
+  pSquish   = 1;
+  pInv      = 0;
+  pIsJumping = false;
+}
+
+function doJump() {
+  if (pJumps > 0) {
+    pvy    = -16.5;
+    pJumps--;
+    pIsJumping = true;
+  }
+}
+
+// ── BARRELS ───────────────────────────────────────────────────────────────────
+let barrels       = [];
+let spawnTimer    = 0;
+let spawnInterval = 115;
+
+function spawnBarrel() {
+  // Pattern variety: single, double, or fast lone barrel
+  const roll = Math.random();
+  if (roll < 0.20 && score > 400) {
+    // Triple at higher score
+    for (let i = 0; i < 3; i++)
+      barrels.push({ x: -BARREL_W - i * 85, y: GROUND - BARREL_H + 5, rot: 0, fast: false });
+  } else if (roll < 0.40) {
+    // Double
+    for (let i = 0; i < 2; i++)
+      barrels.push({ x: -BARREL_W - i * 78, y: GROUND - BARREL_H + 5, rot: 0, fast: false });
+  } else if (roll < 0.55 && score > 200) {
+    // Single fast barrel (fire barrel)
+    barrels.push({ x: -BARREL_W, y: GROUND - BARREL_H + 5, rot: 0, fast: true });
+  } else {
+    // Single normal
+    barrels.push({ x: -BARREL_W, y: GROUND - BARREL_H + 5, rot: 0, fast: false });
+  }
+}
+
+// ── POPUPS ────────────────────────────────────────────────────────────────────
+const popups = [];
+function addPopup(x, y, txt, col = '#ffff00') {
+  popups.push({ x, y, txt, col, life: 55, vy: -1.4 });
+}
+
+// ── SCROLLING BACKGROUND ELEMENTS ─────────────────────────────────────────────
+let groundScroll = 0;
+// Clouds drifting slowly from left
+const clouds = [
+  { x: 100, y: 50,  s: 0.4, w: 110, h: 40 },
+  { x: 400, y: 30,  s: 0.3, w: 150, h: 50 },
+  { x: 650, y: 70,  s: 0.5, w: 90,  h: 35 },
+  { x: 220, y: 90,  s: 0.25,w: 120, h: 38 },
+];
+
+// ── UPDATE ────────────────────────────────────────────────────────────────────
+function update() {
+  frameCount++;
+
+  // Speed curve: increases every 250 pts, capped at x3
+  gameSpeed = Math.min(3.0, 1 + Math.floor(score / 250) * 0.2);
+
+  // Player physics
+  pvy += 0.75;
+  py  += pvy;
+
+  if (py >= GROUND - CHAR_H) {
+    py  = GROUND - CHAR_H;
+    pvy = 0;
+    pJumps = 2;
+    if (pIsJumping) { pSquish = 1.45; pIsJumping = false; }
+  }
+  if (pSquish > 1) { pSquish -= 0.08; if (pSquish < 1) pSquish = 1; }
+  if (pInv > 0) pInv--;
+
+  // Spawn barrels
+  spawnInterval = Math.max(48, 115 - Math.floor(score / 180) * 7);
+  spawnTimer++;
+  if (spawnTimer >= spawnInterval) { spawnBarrel(); spawnTimer = 0; }
+
+  // Move barrels (from left to right)
+  const baseSpeed = 6.2 * gameSpeed;
+  const pw = charImg ? Math.round(CHAR_H * charAspect) : CHAR_W;
+
+  for (let i = barrels.length - 1; i >= 0; i--) {
+    const b  = barrels[i];
+    const bv = b.fast ? baseSpeed * 1.65 : baseSpeed;
+    b.x  += bv;
+    b.rot -= bv * 0.045;   // rotate opposite direction (rolling from left)
+
+    // Passed character → score
+    if (b.x > W + 60) {
+      barrels.splice(i, 1);
+      score += 10;
+      updateUI();
+      continue;
+    }
+
+    // Collision (inset hitbox)
+    const hIn = 16, vIn = 22;
+    if (!pInv &&
+        px + hIn         < b.x + BARREL_W - hIn &&
+        px + pw - hIn    > b.x + hIn &&
+        py + vIn         < b.y + BARREL_H - 6 &&
+        py + CHAR_H - vIn > b.y + 6) {
+      hit();
+      return;
+    }
+  }
+
+  // Passive score
+  if (frameCount % 2 === 0) { score++; updateUI(); }
+
+  // Scroll
+  groundScroll = (groundScroll + baseSpeed) % 80;
+  clouds.forEach(cl => {
+    cl.x += cl.s * gameSpeed;
+    if (cl.x > W + 180) cl.x = -180;
+  });
+}
+
+function hit() {
+  lives--;
+  pInv = 110;
+  addPopup(px + (charImg ? Math.round(CHAR_H * charAspect) : CHAR_W) / 2, py + 20, 'AUTSCH!', '#ff3333');
+  updateUI();
+  if (lives <= 0) {
+    if (score > hiScore) hiScore = score;
+    updateUI();
+    state = ST.GAMEOVER;
+  } else {
+    state = ST.DEAD;
+    setTimeout(() => {
+      if (state === ST.DEAD) {
+        barrels = [];
+        spawnTimer = 0;
+        initPlayerVars();
+        state = ST.PLAYING;
+      }
+    }, 1300);
+  }
+}
+
+function startGame() {
+  score = 0; lives = 3;
+  barrels = []; popups.length = 0;
+  spawnTimer = 0; frameCount = 0; gameSpeed = 1;
+  initPlayerVars();
+  state = ST.PLAYING;
+  updateUI();
+  tryMusic();
+}
+
+function updateUI() {
+  document.getElementById('scoreDisplay').textContent = score;
+  document.getElementById('hiDisplay').textContent    = hiScore;
+  document.getElementById('livesDisplay').textContent = lives;
+}
+
+// ── DRAW ──────────────────────────────────────────────────────────────────────
+function drawBG() {
+  // Sky
+  const sky = ctx.createLinearGradient(0, 0, 0, GROUND);
+  sky.addColorStop(0,   '#8899b8');
+  sky.addColorStop(0.7, '#aabbcc');
+  sky.addColorStop(1,   '#c8d8d8');
+  ctx.fillStyle = sky;
+  ctx.fillRect(0, 0, W, GROUND);
+
+  // Clouds
+  ctx.fillStyle = 'rgba(255,255,255,0.55)';
+  clouds.forEach(cl => {
+    ctx.beginPath();
+    ctx.ellipse(cl.x,         cl.y,          cl.w/2,      cl.h/2,      0, 0, Math.PI*2);
+    ctx.ellipse(cl.x + cl.w*0.35, cl.y - cl.h*0.3, cl.w*0.35, cl.h*0.6, 0, 0, Math.PI*2);
+    ctx.ellipse(cl.x - cl.w*0.25, cl.y - cl.h*0.1, cl.w*0.3,  cl.h*0.5, 0, 0, Math.PI*2);
+    ctx.fill();
+  });
+
+  // Mountains
+  ctx.fillStyle = '#7a8da8';
+  ctx.beginPath();
+  ctx.moveTo(0, GROUND);
+  [0,55,115,185,265,355,440,530,615,695,760,820].forEach((mx, i) => {
+    const heights = [220,155,195,135,175,125,185,145,165,140,200,220];
+    ctx.lineTo(mx, heights[i]);
+  });
+  ctx.lineTo(820, GROUND);
+  ctx.fill();
+
+  ctx.fillStyle = '#9aadbe';
+  ctx.beginPath();
+  ctx.moveTo(0, GROUND);
+  [0,70,155,240,330,415,510,600,690,760,820].forEach((mx, i) => {
+    const heights = [240,195,220,185,210,175,215,195,215,200,240];
+    ctx.lineTo(mx, heights[i]);
+  });
+  ctx.lineTo(820, GROUND);
+  ctx.fill();
+
+  // Ground
+  const gr = ctx.createLinearGradient(0, GROUND, 0, H);
+  gr.addColorStop(0,    '#4e6e30');
+  gr.addColorStop(0.2,  '#3d5a22');
+  gr.addColorStop(1,    '#1e2e0e');
+  ctx.fillStyle = gr;
+  ctx.fillRect(0, GROUND, W, H - GROUND);
+
+  // Ground line
+  ctx.strokeStyle = '#2e4a15';
+  ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(0, GROUND + 1);
+  ctx.lineTo(W, GROUND + 1);
+  ctx.stroke();
+
+  // Ground texture marks (scroll from right to left ← matches old direction BUT now
+  // barrels move RIGHT so ground should scroll the other way — or keep static)
+  ctx.fillStyle = '#2e4415';
+  for (let x = groundScroll - 80; x < W + 80; x += 80) {
+    ctx.fillRect(x, GROUND + 5, 30, 3);
+    ctx.fillRect(x + 45, GROUND + 9, 18, 3);
+  }
+}
+
+function drawBarrels() {
+  for (const b of barrels) {
+    ctx.save();
+    ctx.translate(b.x + BARREL_W/2, b.y + BARREL_H/2);
+    ctx.rotate(b.rot);
+
+    // Fire barrel glow
+    if (b.fast) {
+      ctx.shadowColor = '#ff6600';
+      ctx.shadowBlur  = 14;
+    }
+
+    ctx.fillStyle = b.fast ? '#aa2200' : '#7b3a10';
+    ctx.beginPath();
+    ctx.ellipse(0, 0, BARREL_W/2, BARREL_H/2, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // Wood grain
+    ctx.strokeStyle = b.fast ? '#881100' : '#5c2808';
+    ctx.lineWidth = 2;
+    for (const lx of [-BARREL_W*0.2, 0, BARREL_W*0.2]) {
+      ctx.beginPath();
+      ctx.moveTo(lx, -BARREL_H/2 + 6);
+      ctx.lineTo(lx,  BARREL_H/2 - 6);
+      ctx.stroke();
+    }
+
+    // Rings
+    ctx.strokeStyle = b.fast ? '#ff8844' : '#c8a050';
+    ctx.lineWidth = 3;
+    for (const ry of [-BARREL_H*0.28, 0, BARREL_H*0.28]) {
+      ctx.beginPath();
+      ctx.ellipse(0, ry, BARREL_W/2, 4, 0, 0, Math.PI*2);
+      ctx.stroke();
+    }
+
+    // Shine
+    ctx.fillStyle = 'rgba(255,200,150,0.12)';
+    ctx.beginPath();
+    ctx.ellipse(-BARREL_W*0.15, -BARREL_H*0.2, BARREL_W*0.22, BARREL_H*0.22, -0.4, 0, Math.PI*2);
+    ctx.fill();
+
+    ctx.restore();
+  }
+}
+
+function drawPlayer() {
+  if (pInv > 0 && Math.floor(pInv / 7) % 2 === 0) return;
+
+  const pw = charImg ? Math.round(CHAR_H * charAspect) : CHAR_W;
+
+  ctx.save();
+  ctx.translate(px + pw/2, py + CHAR_H);
+  ctx.scale(1/pSquish, pSquish);
+  ctx.translate(-(px + pw/2), -(py + CHAR_H));
+
+  if (charImg) {
+    ctx.drawImage(charImg, px, py, pw, CHAR_H);
+  } else {
+    // Fallback
+    ctx.fillStyle = '#886644';
+    ctx.fillRect(px, py, pw, CHAR_H);
+  }
+
+  ctx.restore();
+
+  // Shadow
+  ctx.save();
+  ctx.globalAlpha = 0.28;
+  ctx.fillStyle = '#000';
+  ctx.beginPath();
+  ctx.ellipse(px + pw/2, GROUND + 4, pw * 0.38 / pSquish, 7, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawPopups() {
+  for (let i = popups.length-1; i >= 0; i--) {
+    const p = popups[i];
+    p.y   += p.vy;
+    p.life--;
+    if (p.life <= 0) { popups.splice(i, 1); continue; }
+    ctx.save();
+    ctx.globalAlpha = p.life / 55;
+    ctx.fillStyle   = p.col;
+    ctx.font        = 'bold 20px Courier New';
+    ctx.textAlign   = 'center';
+    ctx.shadowColor = p.col;
+    ctx.shadowBlur  = 8;
+    ctx.fillText(p.txt, p.x, p.y);
+    ctx.restore();
+  }
+}
+
+function drawHUD() {
+  if (gameSpeed > 1) {
+    ctx.save();
+    ctx.font        = '12px Courier New';
+    ctx.fillStyle   = '#ffaa00';
+    ctx.textAlign   = 'left';
+    ctx.globalAlpha = 0.7;
+    ctx.fillText('SPEED ×' + gameSpeed.toFixed(1), 10, H - 8);
+    ctx.restore();
+  }
+}
+
+function drawMenu() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+
+  ctx.font      = 'bold 52px Courier New';
+  ctx.fillStyle = '#ffcc00';
+  ctx.shadowColor = '#ff8800'; ctx.shadowBlur = 22;
+  ctx.fillText('NORMAL MAXI DAY', W/2, H/2 - 85);
+
+  ctx.font      = 'bold 28px Courier New';
+  ctx.fillStyle = '#ff6600';
+  ctx.shadowColor = '#ff3300'; ctx.shadowBlur = 14;
+  ctx.fillText('T-REX EDITION', W/2, H/2 - 42);
+
+  ctx.shadowBlur  = 0;
+  ctx.font        = '20px Courier New';
+  ctx.fillStyle   = Math.floor(frameCount/20) % 2 ? '#ffffff' : '#777777';
+  ctx.fillText('LEERTASTE oder KLICK zum Starten', W/2, H/2 + 35);
+
+  ctx.font      = '13px Courier New';
+  ctx.fillStyle = '#888888';
+  ctx.fillText('Hüpf über die Fässer!  Feuer-Fässer sind schneller!', W/2, H/2 + 70);
+  ctx.fillText('Je länger du überlebst, desto schneller wird es...', W/2, H/2 + 92);
+  ctx.restore();
+}
+
+function drawDead() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(160,0,0,0.38)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign   = 'center';
+  ctx.font        = 'bold 50px Courier New';
+  ctx.fillStyle   = '#ffffff';
+  ctx.shadowColor = '#ff0000'; ctx.shadowBlur = 20;
+  ctx.fillText('AUTSCH!', W/2, H/2 + 12);
+  ctx.restore();
+}
+
+function drawGameOver() {
+  ctx.save();
+  ctx.fillStyle = 'rgba(0,0,0,0.78)';
+  ctx.fillRect(0, 0, W, H);
+  ctx.textAlign = 'center';
+
+  ctx.font      = 'bold 60px Courier New';
+  ctx.fillStyle = '#ff2200';
+  ctx.shadowColor = '#ff2200'; ctx.shadowBlur = 28;
+  ctx.fillText('GAME OVER', W/2, H/2 - 70);
+
+  ctx.shadowBlur  = 0;
+  ctx.font        = 'bold 28px Courier New';
+  ctx.fillStyle   = '#ffdd00';
+  ctx.fillText('SCORE: ' + score, W/2, H/2 - 10);
+
+  if (score > 0 && score >= hiScore) {
+    ctx.font      = '17px Courier New';
+    ctx.fillStyle = '#00ffcc';
+    ctx.fillText('★  NEUER HIGHSCORE!  ★', W/2, H/2 + 30);
+  }
+
+  ctx.font      = '20px Courier New';
+  ctx.fillStyle = Math.floor(frameCount/20) % 2 ? '#ffffff' : '#666666';
+  ctx.fillText('LEERTASTE oder KLICK zum Neustart', W/2, H/2 + 85);
+  ctx.restore();
+}
+
+// ── LOOP ──────────────────────────────────────────────────────────────────────
+function loop() {
+  frameCount++;
+  if (state === ST.PLAYING) update();
+
+  drawBG();
+  drawBarrels();
+  drawPlayer();
+  drawPopups();
+  drawHUD();
+
+  if (state === ST.MENU)     drawMenu();
+  if (state === ST.DEAD)     drawDead();
+  if (state === ST.GAMEOVER) drawGameOver();
+
+  requestAnimationFrame(loop);
+}
+
+// ── INPUT ─────────────────────────────────────────────────────────────────────
+document.addEventListener('keydown', e => {
+  if (e.code !== 'Space') return;
+  e.preventDefault();
+  tryMusic();
+  if (state === ST.MENU || state === ST.GAMEOVER) { startGame(); return; }
+  if (state === ST.PLAYING) doJump();
+});
+
+canvas.addEventListener('click', () => {
+  tryMusic();
+  if (state === ST.MENU || state === ST.GAMEOVER) { startGame(); return; }
+  if (state === ST.PLAYING) doJump();
+});
+
+canvas.addEventListener('touchstart', e => {
+  e.preventDefault();
+  tryMusic();
+  if (state === ST.MENU || state === ST.GAMEOVER) { startGame(); return; }
+  if (state === ST.PLAYING) doJump();
+}, { passive: false });
+
+// Start immediately — image loads in background
+initPlayerVars();
+loop();
+</script>
+</body>
+</html>
